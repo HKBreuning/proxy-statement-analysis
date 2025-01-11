@@ -1,0 +1,189 @@
+!pip install pytesseract pdf2image spacy PyPDF2 transformers
+!apt-get install tesseract-ocr
+!apt-get install -y poppler-utils
+!python -m spacy download en_core_web_sm
+
+from pdf2image import convert_from_path
+import pytesseract
+import spacy
+import pandas as pd
+import re
+import os
+from google.colab import drive
+from concurrent.futures import ThreadPoolExecutor
+import gc
+from PyPDF2 import PdfReader
+from transformers import pipeline
+
+drive.mount('/content/drive')
+
+qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
+
+def get_pdf_page_count(pdf_path):
+    with open(pdf_path, 'rb') as file:
+        reader = PdfReader(file)
+        return len(reader.pages)
+
+def find_relevant_pages(pdf_path, keywords):
+    relevant_pages = []
+    with open(pdf_path, 'rb') as file:
+        reader = PdfReader(file)
+        for page_num, page in enumerate(reader.pages, start=1):
+            text = page.extract_text()
+            if any(keyword.lower() in text.lower() for keyword in keywords):
+                relevant_pages.append(page_num)
+    return relevant_pages
+
+def extract_text_from_pdf(pdf_path, relevant_pages):
+    try:
+        pages = convert_from_path(pdf_path, 200, thread_count=1)
+        text = ""
+        for page_num in relevant_pages:
+            text += pytesseract.image_to_string(pages[page_num - 1])
+        return text
+    except Exception as e:
+        print(f"Error extracting text from {pdf_path}: {e}")
+        return ""
+
+nlp = spacy.load("en_core_web_sm")
+
+def extract_information(text):
+    try:
+        doc = nlp(text)
+        entities = []
+        for ent in doc.ents:
+            entities.append((ent.text, ent.label_))
+        return entities
+    except Exception as e:
+        print(f"Error extracting information: {e}")
+        return []
+
+def extract_age_tenure_gender(text, board_members):
+    try:
+        ages = []
+        tenures = []
+        genders = []
+
+        for member in board_members:
+            member_text = text[text.find(member):]
+
+            age_question = f"What is the age of {member}?"
+            age_result = qa_pipeline(question=age_question, context=member_text)
+            ages.append(age_result['answer'] if age_result['answer'] else "Unknown")
+
+            tenure_question = f"What is the tenure of {member}?"
+            tenure_result = qa_pipeline(question=tenure_question, context=member_text)
+            tenures.append(tenure_result['answer'] if tenure_result['answer'] else "Unknown")
+
+            gender_question = f"What is the gender of {member}?"
+            gender_result = qa_pipeline(question=gender_question, context=member_text)
+            genders.append(gender_result['answer'] if gender_result['answer'] else "Unknown")
+
+        return ages, tenures, genders
+    except Exception as e:
+        print(f"Error extracting age, tenure, and gender: {e}")
+        return [], [], []
+
+def extract_company_and_year(text):
+    try:
+        # Extract company name
+        company_pattern = r'(.+)\sProxyStatement\s\d{4}'
+        match = re.search(company_pattern, text)
+        if match:
+            company = match.group(1).strip()
+        else:
+            company = "Unknown"
+
+        # Extract year
+        year_pattern = r'ProxyStatement\s(\d{4})'
+        match = re.search(year_pattern, text)
+        if match:
+            year = match.group(1)
+        else:
+            year = "Unknown"
+
+        return company, year
+    except Exception as e:
+        print(f"Error extracting company and year: {e}")
+        return None, None
+
+def process_proxy_statement(pdf_path):
+    try:
+        keywords = ["Corporate Governance", "Board Information", "Board of Directors", "Management", "Board Diversity"]
+        relevant_pages = find_relevant_pages(pdf_path, keywords)
+        if not relevant_pages:
+            print(f"No relevant pages found in {pdf_path}")
+            return pd.DataFrame()
+
+        text = extract_text_from_pdf(pdf_path, relevant_pages)
+        if not text:
+            print(f"No text extracted from {pdf_path}")
+            return pd.DataFrame()
+
+        company, year = extract_company_and_year(text)
+        if not company or not year:
+            print(f"No company or year extracted from {pdf_path}")
+            return pd.DataFrame()
+
+        entities = extract_information(text)
+        board_members = [ent[0] for ent in entities if ent[1] == "PERSON"]
+
+        ages = []
+        tenures = []
+        genders = []
+
+        ages, tenures, genders = extract_age_tenure_gender(text, board_members)
+
+        max_length = max(len(board_members), len(ages), len(tenures), len(genders))
+        board_members += [""] * (max_length - len(board_members))
+        ages += ["Unknown"] * (max_length - len(ages))
+        tenures += ["Unknown"] * (max_length - len(tenures))
+        genders += ["Unknown"] * (max_length - len(genders))
+
+        data = []
+        for i in range(max_length):
+            data.append({
+                'Company': company,
+                'Year': year,
+                'NameBoardMember': board_members[i],
+                'Gender': genders[i],
+                'Age': ages[i],
+                'Tenure': tenures[i]
+            })
+
+        df = pd.DataFrame(data)
+        return df
+    except Exception as e:
+        print(f"Error processing {pdf_path}: {e}")
+        return pd.DataFrame()
+
+proxy_statements_path = '/content/drive/MyDrive/Proxy_Statements'
+
+all_data = []
+pdf_files = [os.path.join(proxy_statements_path, file_name) for file_name in os.listdir(proxy_statements_path) if file_name.endswith('.pdf')]
+
+batch_size = 1  # Process one file at a time to reduce memory usage
+for i in range(0, len(pdf_files), batch_size):
+    batch_files = pdf_files[i:i + batch_size]
+
+    def process_file(pdf_path):
+        print(f"Processing {pdf_path}")
+        df = process_proxy_statement(pdf_path)
+        return df
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        results = list(executor.map(process_file, batch_files))
+
+    if results:
+        combined_df = pd.concat(results, ignore_index=True)
+        all_data.append(combined_df)
+
+    gc.collect()
+
+if all_data:
+    combined_df = pd.concat(all_data, ignore_index=True)
+    print(combined_df)
+
+    combined_df.to_csv('combined_proxy_statements_data.csv', index=False)
+else:
+    print("No data extracted.")
